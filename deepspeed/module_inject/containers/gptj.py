@@ -127,10 +127,6 @@ class DS_GPTJContainer(MetaTensorContainer, BaseTransformerContainer):
         self.module.attention.attn_vw = self.vw
         self.module.attention.attn_vb = self.vb
 
-    def update_merged_qkv(self):
-        if hasattr(self, '_update_merged_qkv'):
-            self._update_merged_qkv()
-
     def reset_qkv(self):
         self.qkvw.data[:self.qw.shape[0]] = self.qw.data
         self.qkvw.data[self.qw.shape[0]:2 * self.qw.shape[0]] = self.kw.data

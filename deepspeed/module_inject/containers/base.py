@@ -347,6 +347,10 @@ class BaseTransformerContainer(ABC):
         self.module.norm_w.data.copy_(self.input_nw.to(get_accelerator().current_device_name()))
         self.module.norm_b.data.copy_(self.input_nb.to(get_accelerator().current_device_name()))
 
+    def update_merged_qkv(self):
+        if hasattr(self, '_update_merged_qkv'):
+            self._update_merged_qkv()
+
     def transpose(self):
         self.transpose_attention()
         self.transpose_mlp()
