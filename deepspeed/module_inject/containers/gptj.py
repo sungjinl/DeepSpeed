@@ -12,6 +12,7 @@ from ..policy import TransformerPolicy
 from ..policy import transformer_param_names
 from ..policy import maybe_copy
 from ..policy import maybe_copy_qkv
+from ..policy import maybe_get_lora
 
 
 class DS_GPTJContainer(MetaTensorContainer, BaseTransformerContainer):
@@ -56,6 +57,139 @@ class DS_GPTJContainer(MetaTensorContainer, BaseTransformerContainer):
             maybe_copy(module, sd, weight_quantizer, mp_replace, transformer_param_names[i + 2],
                        prefix + param_names[i])
 
+    def attention_q_k_v_mp(self, mp_replace, reversed_dim=False):
+        self.module.attention.attn_qw = mp_replace.copy(self.module.attention.attn_qw[:self.qw.shape[0] //
+                                                                                      mp_replace.mp_size],
+                                                        self.qw,
+                                                        int8=reversed_dim,
+                                                        allocat_tensor=reversed_dim)
+        self.module.attention.attn_kw = mp_replace.copy(self.module.attention.attn_kw[:self.qw.shape[0] //
+                                                                                      mp_replace.mp_size],
+                                                        self.kw,
+                                                        int8=reversed_dim,
+                                                        allocat_tensor=reversed_dim)
+        self.module.attention.attn_vw = mp_replace.copy(self.module.attention.attn_vw[:self.qw.shape[0] //
+                                                                                      mp_replace.mp_size],
+                                                        self.vw,
+                                                        int8=reversed_dim,
+                                                        allocat_tensor=reversed_dim)
+        self.module.attention.attn_qb = mp_replace.copy(
+            self.module.attention.attn_qb[:self.qw.shape[0] // mp_replace.mp_size],
+            self.qb,
+            int8=reversed_dim,
+            allocat_tensor=reversed_dim) if self.module.attention.attn_qb is not None else None
+        self.module.attention.attn_kb = mp_replace.copy(
+            self.module.attention.attn_kb[:self.qw.shape[0] // mp_replace.mp_size],
+            self.kb,
+            int8=reversed_dim,
+            allocat_tensor=reversed_dim) if self.module.attention.attn_kb is not None else None
+        self.module.attention.attn_vb = mp_replace.copy(
+            self.module.attention.attn_vb[:self.qw.shape[0] // mp_replace.mp_size],
+            self.vb,
+            int8=reversed_dim,
+            allocat_tensor=reversed_dim) if self.module.attention.attn_vb is not None else None
+
+    def mlp_inter_mp(self, mp_replace, reversed_dim=False):
+        if reversed_dim:
+            self.module.mlp.inter_w = mp_replace.copy(self.module.mlp.inter_w[:self._h4h_w.shape[0] //
+                                                                              mp_replace.mp_size],
+                                                      self._h4h_w,
+                                                      int8=reversed_dim,
+                                                      allocat_tensor=reversed_dim)
+            self.module.mlp.inter_b = mp_replace.copy(
+                    self.module.mlp.inter_b[:self._h4h_w.shape[0] // mp_replace.mp_size],
+                    self._h4h_b,
+                    int8=reversed_dim,
+                    allocat_tensor=reversed_dim) if self.module.mlp.inter_b is not None else None
+        else:
+            self.module.mlp.inter_w = mp_replace.copy(self.module.mlp.inter_w, self._h4h_w, int8=reversed_dim)
+            self.module.mlp.inter_b = mp_replace.copy(self.module.mlp.inter_b, self._h4h_b, int8=reversed_dim)
+
+    def release_qkv(self):
+        del self.module.attention.attn_qkvw
+        del self.module.attention.attn_qkvb
+        self.module.attention.attn_qkvw = None
+        self.module.attention.attn_qkvb = None
+
+        qkv_data = [self.module.attention.attn_qw.data, \
+                self.module.attention.attn_qb.data if self.module.attention.attn_qb is not None else None, \
+                self.module.attention.attn_kw.data, \
+                self.module.attention.attn_kb.data if self.module.attention.attn_kb is not None else None, \
+                self.module.attention.attn_vw.data, \
+                self.module.attention.attn_vb.data if self.module.attention.attn_vb is not None else None]
+        for data in qkv_data:
+            del data
+
+        self.module.attention.attn_qw = self.qw
+        self.module.attention.attn_qb = self.qb
+        self.module.attention.attn_kw = self.kw
+        self.module.attention.attn_kb = self.kb
+        self.module.attention.attn_vw = self.vw
+        self.module.attention.attn_vb = self.vb
+
+    def update_merged_qkv(self):
+        if hasattr(self, '_update_merged_qkv'):
+            self._update_merged_qkv()
+
+    def reset_qkv(self):
+        self.qkvw.data[:self.qw.shape[0]] = self.qw.data
+        self.qkvw.data[self.qw.shape[0]:2 * self.qw.shape[0]] = self.kw.data
+        self.qkvw.data[2 * self.qw.shape[0]:] = self.vw.data
+        if self.qkvb is not None:
+            self.qkvb.data[:self.qw.shape[0]] = self.qb.data
+            self.qkvb.data[self.qw.shape[0]:2 * self.qw.shape[0]] = self.kb.data
+            self.qkvb.data[2 * self.qw.shape[0]:] = self.vb.data
+
+        qkv_data = [self.qw.data, \
+                    self.qb.data if self.qb is not None else None, \
+                    self.kw.data, \
+                    self.kb.data if self.kb is not None else None, \
+                    self.vw.data, \
+                    self.vb.data if self.vb is not None else None]
+
+        self.qw.data = self.qkvw.data[:self.qw.shape[0]]
+        self.kw.data = self.qkvw.data[self.qw.shape[0]:2 * self.qw.shape[0]]
+        self.vw.data = self.qkvw.data[2 * self.qw.shape[0]:]
+
+        if self.qkvb is not None:
+            self.qb.data = self.qkvb.data[:self.qw.shape[0]]
+            self.kb.data = self.qkvb.data[self.qw.shape[0]:2 * self.qw.shape[0]]
+            self.vb.data = self.qkvb.data[2 * self.qw.shape[0]:]
+
+        for data in qkv_data:
+            del data
+
+    def set_params_wo_copy(self, Z3_enabled=False):
+        self.module.mlp.attn_nw = self.attn_nw
+        self.module.mlp.attn_nb = self.attn_nb
+        self.module.norm_w = self.input_nw
+        self.module.norm_b = self.input_nb
+        self.module.mlp.inter_w = self._h4h_w
+        self.module.mlp.inter_b = self._h4h_b
+        self.module.mlp.output_w = self._4hh_w
+        self.module.mlp.output_b = self._4hh_b
+        self.module.attention.attn_ow = self.dense_w
+        self.module.attention.attn_ob = self.dense_b
+        if not Z3_enabled or self.q_k_v is None:
+            self.module.attention.attn_qkvw = self.qkvw
+            self.module.attention.attn_qkvb = self.qkvb
+        if self.q_k_v is not None:
+            if Z3_enabled:
+                self.module.attention.attn_qw = self.qw
+                self.module.attention.attn_qb = self.qb
+                self.module.attention.attn_kw = self.kw
+                self.module.attention.attn_kb = self.kb
+                self.module.attention.attn_vw = self.vw
+                self.module.attention.attn_vb = self.vb
+            else:
+                self.qw.data = self.qkvw[:self.qw.shape[0], :]
+                self.kw.data = self.qkvw[self.qw.shape[0]:2 * self.qw.shape[0], :]
+                self.vw.data = self.qkvw[self.qw.shape[0] * 2:, :]
+                if self.qkvb is not None:
+                    self.qb.data = self.qkvb[:self.qw.shape[0]]
+                    self.kb.data = self.qkvb[self.qw.shape[0]:2 * self.qw.shape[0]]
+                    self.vb.data = self.qkvb[self.qw.shape[0] * 2:]
+
 
 class HFGPTJLayerPolicy(TransformerPolicy):
     _orig_layer_class = None
@@ -70,12 +204,17 @@ class HFGPTJLayerPolicy(TransformerPolicy):
             HFGPTJLayerPolicy._orig_layer_class = None
 
     def get_hidden_heads(self):
-        return self.client_module.attn.q_proj.weight.shape[1], \
+        return self.client_module.attn.embed_dim, \
                 self.client_module.attn.num_attention_heads, \
                 self.client_module.ln_1.eps
 
     def get_q_k_v(self):
-        return None
+        return self.client_module.attn.q_proj.weight, \
+            None, \
+            self.client_module.attn.k_proj.weight, \
+            None, \
+            self.client_module.attn.v_proj.weight, \
+            None
 
     def attention(self, enable_training=False):
         qw = self.client_module.attn.q_proj.weight
@@ -102,4 +241,14 @@ class HFGPTJLayerPolicy(TransformerPolicy):
                self.client_module.ln_1.bias
 
     def get_lora_params(self):
-        return []
+        all_lora_params = []
+        for p in [
+            self.client_module.mlp.fc_in, \
+            self.client_module.mlp.fc_out, \
+            self.client_module.attn.q_proj, \
+            self.client_module.attn.k_proj, \
+            self.client_module.attn.v_proj, \
+            self.client_module.attn.out_proj, \
+            ]:
+            all_lora_params.append(maybe_get_lora(p))
+        return all_lora_params
